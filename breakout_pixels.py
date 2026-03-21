@@ -96,29 +96,18 @@ class BreakoutPixels(pufferlib.PufferEnv):
         self._gpu_stack = None
         self.tick = 0
 
-    def _render_and_stack(self):
-        """Render current state to pixels and push into frame stack."""
-        if self._gpu_stack is not None:
-            # GPU path: render directly on GPU, keep frame stack on GPU
-            frames_gpu = batch_render_gpu(self._inner.observations,
-                                          self.frame_h, self.frame_w)
-            self._gpu_stack[:, :-1] = self._gpu_stack[:, 1:].clone()
-            self._gpu_stack[:, -1] = frames_gpu
-            # Copy to CPU observation buffer for PufferLib
-            self.observations[:] = self._gpu_stack.cpu().numpy()
-        else:
-            frames = batch_render(self._inner.observations, self.num_agents,
-                                  self.frame_h, self.frame_w)
-            self._frame_stack[:, :-1] = self._frame_stack[:, 1:]
-            self._frame_stack[:, -1] = frames
-            self.observations[:] = self._frame_stack
+    def _render_gpu(self):
+        """Render current state on GPU and update GPU frame stack."""
+        frames_gpu = batch_render_gpu(self._inner.observations,
+                                      self.frame_h, self.frame_w)
+        self._gpu_stack[:, :-1] = self._gpu_stack[:, 1:].clone()
+        self._gpu_stack[:, -1] = frames_gpu
 
     def reset(self, seed=0):
         self._inner.reset(seed)
         self._frame_stack[:] = 0
 
         if torch.cuda.is_available():
-            # Initialize GPU frame stack
             frames_gpu = batch_render_gpu(self._inner.observations,
                                           self.frame_h, self.frame_w)
             self._gpu_stack = torch.zeros(
@@ -138,25 +127,43 @@ class BreakoutPixels(pufferlib.PufferEnv):
         self.tick = 0
         return self.observations, []
 
+    def reset_gpu(self, seed=0):
+        """Reset and return GPU tensor directly. No CPU copy."""
+        self._inner.reset(seed)
+        frames_gpu = batch_render_gpu(self._inner.observations,
+                                      self.frame_h, self.frame_w)
+        self._gpu_stack = torch.zeros(
+            self.num_agents, self.framestack, self.frame_h, self.frame_w,
+            dtype=torch.uint8, device='cuda')
+        for i in range(self.framestack):
+            self._gpu_stack[:, i] = frames_gpu
+        self.tick = 0
+        return self._gpu_stack
+
     def step(self, actions):
         self._inner.actions[:] = actions
         self._inner.step(actions)
         self.tick += 1
 
-        # Copy rewards/terminals from inner env
         self.rewards[:] = self._inner.rewards
         self.terminals[:] = self._inner.terminals
         self.truncations[:] = self._inner.truncations
 
-        # Reset frame stack for terminated envs
         terminated = np.where(self.terminals | self.truncations)[0]
         if len(terminated) > 0:
             self._frame_stack[terminated] = 0
             if self._gpu_stack is not None:
                 self._gpu_stack[terminated] = 0
 
-        # Render new frame
-        self._render_and_stack()
+        if self._gpu_stack is not None:
+            self._render_gpu()
+            self.observations[:] = self._gpu_stack.cpu().numpy()
+        else:
+            frames = batch_render(self._inner.observations, self.num_agents,
+                                  self.frame_h, self.frame_w)
+            self._frame_stack[:, :-1] = self._frame_stack[:, 1:]
+            self._frame_stack[:, -1] = frames
+            self.observations[:] = self._frame_stack
 
         info = []
         if self.tick % self.log_interval == 0:
@@ -165,8 +172,27 @@ class BreakoutPixels(pufferlib.PufferEnv):
 
         return self.observations, self.rewards, self.terminals, self.truncations, info
 
+    def step_gpu(self, actions_np):
+        """Step and return GPU tensor directly. No CPU observation copy."""
+        self._inner.actions[:] = actions_np
+        self._inner.step(actions_np)
+        self.tick += 1
+
+        self.rewards[:] = self._inner.rewards
+        self.terminals[:] = self._inner.terminals
+        self.truncations[:] = self._inner.truncations
+
+        terminated = np.where(self.terminals | self.truncations)[0]
+        if len(terminated) > 0:
+            self._gpu_stack[terminated] = 0
+
+        self._render_gpu()
+        return self._gpu_stack, self.rewards, self.terminals, self.truncations
+
     def render(self):
-        return self._frame_stack[0, -1]  # Latest frame of first env
+        if self._gpu_stack is not None:
+            return self._gpu_stack[0, -1].cpu().numpy()
+        return self._frame_stack[0, -1]
 
     def close(self):
         self._inner.close()
@@ -297,30 +323,36 @@ if __name__ == '__main__':
         sys.exit(0)
 
     # === TRAINING (CleanRL-style PPO) ===
+    # Compile policy for faster forward/backward
+    compiled_policy = torch.compile(policy, mode='reduce-overhead')
+    scaler = torch.amp.GradScaler('cuda')
     optimizer = torch.optim.Adam(policy.parameters(), lr=args.learning_rate, eps=1e-5)
 
     batch_size = args.num_envs * args.num_steps
     minibatch_size = batch_size // args.num_minibatches
     num_iterations = args.total_timesteps // batch_size
 
-    # Storage
+    # Storage — all on GPU
     obs_buf = torch.zeros((args.num_steps, args.num_envs) +
-                          env.single_observation_space.shape, dtype=torch.uint8).to(device)
-    actions_buf = torch.zeros((args.num_steps, args.num_envs), dtype=torch.long).to(device)
-    logprobs_buf = torch.zeros((args.num_steps, args.num_envs)).to(device)
-    rewards_buf = torch.zeros((args.num_steps, args.num_envs)).to(device)
-    dones_buf = torch.zeros((args.num_steps, args.num_envs)).to(device)
-    values_buf = torch.zeros((args.num_steps, args.num_envs)).to(device)
+                          env.single_observation_space.shape, dtype=torch.uint8, device=device)
+    actions_buf = torch.zeros((args.num_steps, args.num_envs), dtype=torch.long, device=device)
+    logprobs_buf = torch.zeros((args.num_steps, args.num_envs), device=device)
+    rewards_buf = torch.zeros((args.num_steps, args.num_envs), device=device)
+    dones_buf = torch.zeros((args.num_steps, args.num_envs), device=device)
+    values_buf = torch.zeros((args.num_steps, args.num_envs), device=device)
 
-    # Init
-    next_obs, _ = env.reset()
-    next_obs = torch.as_tensor(next_obs).to(device)
-    next_done = torch.zeros(args.num_envs).to(device)
+    # Use GPU-direct path
+    use_gpu = torch.cuda.is_available()
+    if use_gpu:
+        next_obs = env.reset_gpu()
+    else:
+        next_obs, _ = env.reset()
+        next_obs = torch.as_tensor(next_obs).to(device)
+    next_done = torch.zeros(args.num_envs, device=device)
 
     global_step = 0
     start_time = time.time()
     episode_returns = deque(maxlen=100)
-    # Track per-env cumulative rewards
     env_ep_rewards = np.zeros(args.num_envs, dtype=np.float32)
 
     save_dir = 'experiments'
@@ -328,6 +360,7 @@ if __name__ == '__main__':
 
     print(f"\nTraining for {args.total_timesteps:,} steps ({num_iterations} iterations)")
     print(f"Batch size: {batch_size:,}, Minibatch size: {minibatch_size:,}")
+    print(f"torch.compile: enabled, AMP: bf16")
     print()
 
     for iteration in range(1, num_iterations + 1):
@@ -340,21 +373,25 @@ if __name__ == '__main__':
             obs_buf[step] = next_obs
             dones_buf[step] = next_done
 
-            with torch.no_grad():
-                logits, value = policy.forward_eval(next_obs)
+            with torch.no_grad(), torch.amp.autocast('cuda', dtype=torch.bfloat16):
+                logits, value = compiled_policy.forward_eval(next_obs)
                 values_buf[step] = value.flatten()
-                probs = torch.distributions.Categorical(logits=logits)
+                probs = torch.distributions.Categorical(logits=logits.float())
                 action = probs.sample()
                 logprobs_buf[step] = probs.log_prob(action)
             actions_buf[step] = action
 
-            next_obs_np, reward, term, trunc, infos = env.step(action.cpu().numpy())
-            next_done_np = np.logical_or(term, trunc)
-            rewards_buf[step] = torch.tensor(reward, dtype=torch.float32).to(device)
-            next_obs = torch.as_tensor(next_obs_np).to(device)
-            next_done = torch.as_tensor(next_done_np, dtype=torch.float32).to(device)
+            actions_np = action.cpu().numpy()
+            if use_gpu:
+                next_obs, reward, term, trunc = env.step_gpu(actions_np)
+            else:
+                next_obs_np, reward, term, trunc, infos = env.step(actions_np)
+                next_obs = torch.as_tensor(next_obs_np).to(device)
 
-            # Track episode returns
+            next_done_np = np.logical_or(term, trunc)
+            rewards_buf[step] = torch.as_tensor(reward, dtype=torch.float32, device=device) if not isinstance(reward, torch.Tensor) else reward.to(device)
+            next_done = torch.as_tensor(next_done_np, dtype=torch.float32, device=device)
+
             env_ep_rewards += reward
             done_envs = np.where(next_done_np)[0]
             for idx in done_envs:
@@ -362,8 +399,9 @@ if __name__ == '__main__':
                 env_ep_rewards[idx] = 0.0
 
         # GAE
+        with torch.no_grad(), torch.amp.autocast('cuda', dtype=torch.bfloat16):
+            next_value = compiled_policy.forward_eval(next_obs)[1].flatten().float()
         with torch.no_grad():
-            next_value = policy.forward_eval(next_obs)[1].flatten()
             advantages = torch.zeros_like(rewards_buf)
             lastgaelam = 0
             for t in reversed(range(args.num_steps)):
@@ -385,7 +423,7 @@ if __name__ == '__main__':
         b_returns = returns.reshape(-1)
         b_values = values_buf.reshape(-1)
 
-        # PPO update
+        # PPO update with mixed precision
         b_inds = np.arange(batch_size)
         clipfracs = []
         for epoch in range(args.update_epochs):
@@ -394,33 +432,37 @@ if __name__ == '__main__':
                 end = start + minibatch_size
                 mb_inds = b_inds[start:end]
 
-                logits, newvalue = policy.forward_eval(b_obs[mb_inds])
-                probs = torch.distributions.Categorical(logits=logits)
-                newlogprob = probs.log_prob(b_actions[mb_inds])
-                entropy = probs.entropy()
-                newvalue = newvalue.view(-1)
+                with torch.amp.autocast('cuda', dtype=torch.bfloat16):
+                    logits, newvalue = compiled_policy.forward_eval(b_obs[mb_inds])
+                    logits = logits.float()
+                    newvalue = newvalue.float().view(-1)
+                    probs = torch.distributions.Categorical(logits=logits)
+                    newlogprob = probs.log_prob(b_actions[mb_inds])
+                    entropy = probs.entropy()
 
-                logratio = newlogprob - b_logprobs[mb_inds]
-                ratio = logratio.exp()
+                    logratio = newlogprob - b_logprobs[mb_inds]
+                    ratio = logratio.exp()
 
-                with torch.no_grad():
-                    clipfracs.append(((ratio - 1.0).abs() > args.clip_coef).float().mean().item())
+                    with torch.no_grad():
+                        clipfracs.append(((ratio - 1.0).abs() > args.clip_coef).float().mean().item())
 
-                mb_advantages = b_advantages[mb_inds]
-                mb_advantages = (mb_advantages - mb_advantages.mean()) / (mb_advantages.std() + 1e-8)
+                    mb_advantages = b_advantages[mb_inds]
+                    mb_advantages = (mb_advantages - mb_advantages.mean()) / (mb_advantages.std() + 1e-8)
 
-                pg_loss1 = -mb_advantages * ratio
-                pg_loss2 = -mb_advantages * torch.clamp(ratio, 1 - args.clip_coef, 1 + args.clip_coef)
-                pg_loss = torch.max(pg_loss1, pg_loss2).mean()
+                    pg_loss1 = -mb_advantages * ratio
+                    pg_loss2 = -mb_advantages * torch.clamp(ratio, 1 - args.clip_coef, 1 + args.clip_coef)
+                    pg_loss = torch.max(pg_loss1, pg_loss2).mean()
 
-                v_loss = 0.5 * ((newvalue - b_returns[mb_inds]) ** 2).mean()
-                entropy_loss = entropy.mean()
-                loss = pg_loss - args.ent_coef * entropy_loss + v_loss * args.vf_coef
+                    v_loss = 0.5 * ((newvalue - b_returns[mb_inds]) ** 2).mean()
+                    entropy_loss = entropy.mean()
+                    loss = pg_loss - args.ent_coef * entropy_loss + v_loss * args.vf_coef
 
                 optimizer.zero_grad()
-                loss.backward()
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
                 nn.utils.clip_grad_norm_(policy.parameters(), args.max_grad_norm)
-                optimizer.step()
+                scaler.step(optimizer)
+                scaler.update()
 
         sps = int(global_step / (time.time() - start_time))
         elapsed = time.time() - start_time
