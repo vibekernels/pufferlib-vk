@@ -39,17 +39,25 @@ BRICK_COLORS = np.array([
 ], dtype=np.uint8)
 
 
-from fast_renderer import FastRenderer
+from cuda_renderer import CUDARenderer
 
 _RENDERER = None
 
 def batch_render(state_obs, num_agents, out_h=84, out_w=84):
-    """Batch render using fast GPU renderer."""
+    """Batch render using CUDA kernel renderer."""
     global _RENDERER
     if _RENDERER is None:
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        _RENDERER = FastRenderer(out_h, out_w, device)
+        _RENDERER = CUDARenderer(out_h, out_w, device)
     return _RENDERER.render(state_obs)
+
+def batch_render_gpu(state_obs_np, out_h=84, out_w=84):
+    """Render on GPU, return GPU tensor. Avoids CPU roundtrip."""
+    global _RENDERER
+    if _RENDERER is None:
+        _RENDERER = CUDARenderer(out_h, out_w, 'cuda')
+    obs_gpu = torch.from_numpy(state_obs_np).float().cuda()
+    return _RENDERER.render_tensor(obs_gpu)
 
 
 class BreakoutPixels(pufferlib.PufferEnv):
@@ -85,28 +93,48 @@ class BreakoutPixels(pufferlib.PufferEnv):
         # Frame stack buffer: (num_envs, framestack, H, W)
         self._frame_stack = np.zeros(
             (num_envs, framestack, frame_h, frame_w), dtype=np.uint8)
+        self._gpu_stack = None
         self.tick = 0
 
     def _render_and_stack(self):
         """Render current state to pixels and push into frame stack."""
-        frames = batch_render(self._inner.observations, self.num_agents,
-                              self.frame_h, self.frame_w)
-        # Shift stack left and add new frame
-        self._frame_stack[:, :-1] = self._frame_stack[:, 1:]
-        self._frame_stack[:, -1] = frames
-        # Copy to observation buffer
-        self.observations[:] = self._frame_stack
+        if self._gpu_stack is not None:
+            # GPU path: render directly on GPU, keep frame stack on GPU
+            frames_gpu = batch_render_gpu(self._inner.observations,
+                                          self.frame_h, self.frame_w)
+            self._gpu_stack[:, :-1] = self._gpu_stack[:, 1:].clone()
+            self._gpu_stack[:, -1] = frames_gpu
+            # Copy to CPU observation buffer for PufferLib
+            self.observations[:] = self._gpu_stack.cpu().numpy()
+        else:
+            frames = batch_render(self._inner.observations, self.num_agents,
+                                  self.frame_h, self.frame_w)
+            self._frame_stack[:, :-1] = self._frame_stack[:, 1:]
+            self._frame_stack[:, -1] = frames
+            self.observations[:] = self._frame_stack
 
     def reset(self, seed=0):
         self._inner.reset(seed)
-        # Clear frame stack
         self._frame_stack[:] = 0
-        # Render initial frame into all stack positions
-        frames = batch_render(self._inner.observations, self.num_agents,
-                              self.frame_h, self.frame_w)
-        for i in range(self.framestack):
-            self._frame_stack[:, i] = frames
-        self.observations[:] = self._frame_stack
+
+        if torch.cuda.is_available():
+            # Initialize GPU frame stack
+            frames_gpu = batch_render_gpu(self._inner.observations,
+                                          self.frame_h, self.frame_w)
+            self._gpu_stack = torch.zeros(
+                self.num_agents, self.framestack, self.frame_h, self.frame_w,
+                dtype=torch.uint8, device='cuda')
+            for i in range(self.framestack):
+                self._gpu_stack[:, i] = frames_gpu
+            self.observations[:] = self._gpu_stack.cpu().numpy()
+        else:
+            self._gpu_stack = None
+            frames = batch_render(self._inner.observations, self.num_agents,
+                                  self.frame_h, self.frame_w)
+            for i in range(self.framestack):
+                self._frame_stack[:, i] = frames
+            self.observations[:] = self._frame_stack
+
         self.tick = 0
         return self.observations, []
 
@@ -124,6 +152,8 @@ class BreakoutPixels(pufferlib.PufferEnv):
         terminated = np.where(self.terminals | self.truncations)[0]
         if len(terminated) > 0:
             self._frame_stack[terminated] = 0
+            if self._gpu_stack is not None:
+                self._gpu_stack[terminated] = 0
 
         # Render new frame
         self._render_and_stack()

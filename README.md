@@ -7,7 +7,7 @@ PufferLib Breakout experiments comparing state-based MLP-LSTM vs pixel-based CNN
 ```bash
 python3 -m venv venv
 source venv/bin/activate
-pip install pufferlib[atari] imageio[ffmpeg] Pillow
+pip install pufferlib[atari] imageio[ffmpeg] Pillow ninja
 ```
 
 ## State-based training (MLP-LSTM)
@@ -50,8 +50,20 @@ python breakout_pixels.py eval
 
 The state-based agent achieves perfect scores consistently in under 4 minutes. The CNN agent learns a solid policy from pixels, reaching ~350 avg return in 16 minutes. The speed gap is primarily due to CNN forward/backward pass cost.
 
+## Renderers
+
+The pixel-based agent needs a renderer to convert game state → 84x84 grayscale frames. We have two:
+
+| Renderer | Method | Renders/sec (256 envs) |
+|---|---|---|
+| `fast_renderer.py` | Precomputed brick masks + torch.mm | 219K |
+| `cuda_renderer.py` | Custom CUDA kernel (1 thread/pixel) | 1.3M (numpy) / 31M (GPU tensor) |
+
+The CUDA renderer is used by default. End-to-end training SPS is ~52K regardless of renderer choice — the CNN forward/backward pass is the bottleneck, not rendering.
+
 ## Files
 
 - `breakout_pixels.py` — Pixel-observation PufferEnv wrapper, CNN policy, and PPO training loop
-- `fast_renderer.py` — GPU-accelerated batch renderer (precomputed brick masks + matrix multiply, 760K+ render SPS)
+- `cuda_renderer.py` — CUDA kernel renderer compiled at runtime via `torch.utils.cpp_extension.load_inline`
+- `fast_renderer.py` — Fallback GPU renderer using torch matmul (no CUDA compilation needed)
 - `make_videos.py` — Video generation for the state-based trained agent
