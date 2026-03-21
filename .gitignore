@@ -1,0 +1,7 @@
+venv/
+__pycache__/
+experiments/
+videos/
+resources/
+*.pyc
+runs/
