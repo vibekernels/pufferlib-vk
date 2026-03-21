@@ -40,6 +40,7 @@ BRICK_COLORS = np.array([
 
 
 from cuda_renderer import CUDARenderer
+from fused_cnn import FusedBreakoutCNN
 
 _RENDERER = None
 
@@ -274,17 +275,22 @@ if __name__ == '__main__':
     print(f"Action space: {env.single_action_space}")
     print(f"Num agents: {env.num_agents}")
 
-    # Create policy
-    policy = BreakoutCNN(env, framestack=args.framestack).to(device)
+    # Create policy (FusedBreakoutCNN has fused uint8 normalize CUDA kernel)
+    policy = FusedBreakoutCNN(env, framestack=args.framestack).to(device)
     num_params = sum(p.numel() for p in policy.parameters())
     print(f"Policy params: {num_params:,}")
 
     if args.mode == 'eval':
-        # Load model and generate videos
+        # Load model and generate videos (try fused, fall back to standard)
         model_path = args.model_path or max(
             glob.glob("experiments/breakout_cnn_*.pt"), key=os.path.getctime)
         print(f"Loading: {model_path}")
-        policy.load_state_dict(torch.load(model_path, map_location=device))
+        try:
+            policy.load_state_dict(torch.load(model_path, map_location=device))
+        except RuntimeError:
+            # Fall back to standard CNN for old checkpoints
+            policy = BreakoutCNN(env, framestack=args.framestack).to(device)
+            policy.load_state_dict(torch.load(model_path, map_location=device))
         policy.eval()
 
         eval_env = BreakoutPixels(num_envs=1, framestack=args.framestack)
@@ -323,9 +329,6 @@ if __name__ == '__main__':
         sys.exit(0)
 
     # === TRAINING (CleanRL-style PPO) ===
-    # Compile policy for faster forward/backward
-    compiled_policy = torch.compile(policy, mode='reduce-overhead')
-    scaler = torch.amp.GradScaler('cuda')
     optimizer = torch.optim.Adam(policy.parameters(), lr=args.learning_rate, eps=1e-5)
 
     batch_size = args.num_envs * args.num_steps
@@ -360,7 +363,7 @@ if __name__ == '__main__':
 
     print(f"\nTraining for {args.total_timesteps:,} steps ({num_iterations} iterations)")
     print(f"Batch size: {batch_size:,}, Minibatch size: {minibatch_size:,}")
-    print(f"torch.compile: enabled, AMP: bf16")
+    print(f"Fused CUDA normalize, cuDNN convolutions")
     print()
 
     for iteration in range(1, num_iterations + 1):
@@ -373,10 +376,10 @@ if __name__ == '__main__':
             obs_buf[step] = next_obs
             dones_buf[step] = next_done
 
-            with torch.no_grad(), torch.amp.autocast('cuda', dtype=torch.bfloat16):
-                logits, value = compiled_policy.forward_eval(next_obs)
+            with torch.no_grad():
+                logits, value = policy.forward_eval(next_obs)
                 values_buf[step] = value.flatten()
-                probs = torch.distributions.Categorical(logits=logits.float())
+                probs = torch.distributions.Categorical(logits=logits)
                 action = probs.sample()
                 logprobs_buf[step] = probs.log_prob(action)
             actions_buf[step] = action
@@ -399,9 +402,8 @@ if __name__ == '__main__':
                 env_ep_rewards[idx] = 0.0
 
         # GAE
-        with torch.no_grad(), torch.amp.autocast('cuda', dtype=torch.bfloat16):
-            next_value = compiled_policy.forward_eval(next_obs)[1].flatten().float()
         with torch.no_grad():
+            next_value = policy.forward_eval(next_obs)[1].flatten()
             advantages = torch.zeros_like(rewards_buf)
             lastgaelam = 0
             for t in reversed(range(args.num_steps)):
@@ -423,7 +425,7 @@ if __name__ == '__main__':
         b_returns = returns.reshape(-1)
         b_values = values_buf.reshape(-1)
 
-        # PPO update with mixed precision
+        # PPO update
         b_inds = np.arange(batch_size)
         clipfracs = []
         for epoch in range(args.update_epochs):
@@ -432,37 +434,33 @@ if __name__ == '__main__':
                 end = start + minibatch_size
                 mb_inds = b_inds[start:end]
 
-                with torch.amp.autocast('cuda', dtype=torch.bfloat16):
-                    logits, newvalue = compiled_policy.forward_eval(b_obs[mb_inds])
-                    logits = logits.float()
-                    newvalue = newvalue.float().view(-1)
-                    probs = torch.distributions.Categorical(logits=logits)
-                    newlogprob = probs.log_prob(b_actions[mb_inds])
-                    entropy = probs.entropy()
+                logits, newvalue = policy.forward_eval(b_obs[mb_inds])
+                probs = torch.distributions.Categorical(logits=logits)
+                newlogprob = probs.log_prob(b_actions[mb_inds])
+                entropy = probs.entropy()
+                newvalue = newvalue.view(-1)
 
-                    logratio = newlogprob - b_logprobs[mb_inds]
-                    ratio = logratio.exp()
+                logratio = newlogprob - b_logprobs[mb_inds]
+                ratio = logratio.exp()
 
-                    with torch.no_grad():
-                        clipfracs.append(((ratio - 1.0).abs() > args.clip_coef).float().mean().item())
+                with torch.no_grad():
+                    clipfracs.append(((ratio - 1.0).abs() > args.clip_coef).float().mean().item())
 
-                    mb_advantages = b_advantages[mb_inds]
-                    mb_advantages = (mb_advantages - mb_advantages.mean()) / (mb_advantages.std() + 1e-8)
+                mb_advantages = b_advantages[mb_inds]
+                mb_advantages = (mb_advantages - mb_advantages.mean()) / (mb_advantages.std() + 1e-8)
 
-                    pg_loss1 = -mb_advantages * ratio
-                    pg_loss2 = -mb_advantages * torch.clamp(ratio, 1 - args.clip_coef, 1 + args.clip_coef)
-                    pg_loss = torch.max(pg_loss1, pg_loss2).mean()
+                pg_loss1 = -mb_advantages * ratio
+                pg_loss2 = -mb_advantages * torch.clamp(ratio, 1 - args.clip_coef, 1 + args.clip_coef)
+                pg_loss = torch.max(pg_loss1, pg_loss2).mean()
 
-                    v_loss = 0.5 * ((newvalue - b_returns[mb_inds]) ** 2).mean()
-                    entropy_loss = entropy.mean()
-                    loss = pg_loss - args.ent_coef * entropy_loss + v_loss * args.vf_coef
+                v_loss = 0.5 * ((newvalue - b_returns[mb_inds]) ** 2).mean()
+                entropy_loss = entropy.mean()
+                loss = pg_loss - args.ent_coef * entropy_loss + v_loss * args.vf_coef
 
                 optimizer.zero_grad()
-                scaler.scale(loss).backward()
-                scaler.unscale_(optimizer)
+                loss.backward()
                 nn.utils.clip_grad_norm_(policy.parameters(), args.max_grad_norm)
-                scaler.step(optimizer)
-                scaler.update()
+                optimizer.step()
 
         sps = int(global_step / (time.time() - start_time))
         elapsed = time.time() - start_time
