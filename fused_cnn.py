@@ -152,3 +152,98 @@ class FusedBreakoutCNN(nn.Module):
 
     def decode_actions(self, hidden):
         return self.actor(hidden), self.value_fn(hidden)
+
+
+class BreakoutCNNLSTM(nn.Module):
+    """CNN encoder → LSTM → actor/value.
+
+    The CNN replaces the MLP as a feature extractor, producing 128-dim features
+    (matching what the MLP-LSTM gets from the 118-dim state vector). The LSTM
+    then tracks temporal state (ball velocity, strategy, etc.).
+
+    Architecture mirrors the successful MLP-LSTM:
+      pixels → CNN → 128-dim features → LSTM(128) → actor + value
+    vs:
+      118-dim state → Linear(128) → LSTM(128) → actor + value
+    """
+
+    def __init__(self, env, cnn_features=128, lstm_hidden=128, framestack=4, **kwargs):
+        super().__init__()
+        self.hidden_size = lstm_hidden
+        self.is_continuous = False
+
+        _get_module()
+
+        # CNN encoder → 128-dim features (replaces the MLP's first linear layer)
+        self.encoder = nn.Sequential(
+            pufferlib.pytorch.layer_init(nn.Conv2d(framestack, 32, 8, stride=4)),
+            nn.ReLU(),
+            pufferlib.pytorch.layer_init(nn.Conv2d(32, 64, 4, stride=2)),
+            nn.ReLU(),
+            pufferlib.pytorch.layer_init(nn.Conv2d(64, 64, 3, stride=1)),
+            nn.ReLU(),
+            nn.Flatten(),
+            pufferlib.pytorch.layer_init(nn.Linear(64 * 7 * 7, cnn_features)),
+            nn.ReLU(),
+        )
+
+        # LSTM (for training — processes sequences)
+        self.lstm = nn.LSTM(cnn_features, lstm_hidden, batch_first=False)
+        # LSTMCell (for inference — single step, 3x faster)
+        self.lstm_cell = nn.LSTMCell(cnn_features, lstm_hidden)
+        # Share weights between LSTM and LSTMCell
+        self.lstm_cell.weight_ih = self.lstm.weight_ih_l0
+        self.lstm_cell.weight_hh = self.lstm.weight_hh_l0
+        self.lstm_cell.bias_ih = self.lstm.bias_ih_l0
+        self.lstm_cell.bias_hh = self.lstm.bias_hh_l0
+
+        # Actor/value heads
+        self.actor = pufferlib.pytorch.layer_init(
+            nn.Linear(lstm_hidden, env.single_action_space.n), std=0.01)
+        self.value_fn = pufferlib.pytorch.layer_init(
+            nn.Linear(lstm_hidden, 1), std=1)
+
+    def encode(self, observations):
+        """CNN encode: (B, C, H, W) uint8 → (B, features) float."""
+        x = FusedNormalize.apply(observations)
+        return self.encoder(x)
+
+    def forward_eval(self, observations, state):
+        """Single-step inference using LSTMCell. Updates state in-place."""
+        features = self.encode(observations)
+        h, c = self.lstm_cell(features, (state['lstm_h'], state['lstm_c']))
+        state['lstm_h'] = h
+        state['lstm_c'] = c
+        return self.actor(h), self.value_fn(h)
+
+    def forward_sequence(self, obs_seq, dones_seq, initial_h, initial_c):
+        """Process time sequences for PPO update with done masking.
+
+        Args:
+            obs_seq: (T, B, C, H, W) uint8
+            dones_seq: (T, B) float — 1.0 at timesteps where env was done
+            initial_h: (B, hidden) — LSTM hidden state at start of rollout
+            initial_c: (B, hidden) — LSTM cell state at start of rollout
+        Returns:
+            logits: (T*B, num_actions)
+            values: (T*B, 1)
+        """
+        T, B = obs_seq.shape[:2]
+
+        # Batch-encode ALL observations at once (the expensive part)
+        features = self.encode(obs_seq.reshape(T * B, *obs_seq.shape[2:]))
+        features = features.reshape(T, B, -1)  # (T, B, cnn_features)
+
+        # LSTM with done masking (sequential but cheap)
+        h, c = initial_h, initial_c
+        outputs = []
+        for t in range(T):
+            # Zero LSTM state for envs that were done at this step
+            mask = (1.0 - dones_seq[t]).unsqueeze(-1)
+            h = h * mask
+            c = c * mask
+            h, c = self.lstm_cell(features[t], (h, c))
+            outputs.append(h)
+
+        hidden = torch.stack(outputs).reshape(T * B, -1)
+        return self.actor(hidden), self.value_fn(hidden)

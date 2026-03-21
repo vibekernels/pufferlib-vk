@@ -40,7 +40,7 @@ BRICK_COLORS = np.array([
 
 
 from cuda_renderer import CUDARenderer
-from fused_cnn import FusedBreakoutCNN
+from fused_cnn import FusedBreakoutCNN, BreakoutCNNLSTM
 
 _RENDERER = None
 
@@ -275,22 +275,17 @@ if __name__ == '__main__':
     print(f"Action space: {env.single_action_space}")
     print(f"Num agents: {env.num_agents}")
 
-    # Create policy (FusedBreakoutCNN has fused uint8 normalize CUDA kernel)
-    policy = FusedBreakoutCNN(env, framestack=args.framestack).to(device)
+    # Create policy — CNN-LSTM (CNN extracts features, LSTM tracks temporal state)
+    policy = BreakoutCNNLSTM(env, cnn_features=128, lstm_hidden=128,
+                              framestack=args.framestack).to(device)
     num_params = sum(p.numel() for p in policy.parameters())
-    print(f"Policy params: {num_params:,}")
+    print(f"Policy: CNN(128) → LSTM(128), {num_params:,} params")
 
     if args.mode == 'eval':
-        # Load model and generate videos (try fused, fall back to standard)
         model_path = args.model_path or max(
-            glob.glob("experiments/breakout_cnn_*.pt"), key=os.path.getctime)
+            glob.glob("experiments/breakout_cnn_lstm_*.pt"), key=os.path.getctime)
         print(f"Loading: {model_path}")
-        try:
-            policy.load_state_dict(torch.load(model_path, map_location=device))
-        except RuntimeError:
-            # Fall back to standard CNN for old checkpoints
-            policy = BreakoutCNN(env, framestack=args.framestack).to(device)
-            policy.load_state_dict(torch.load(model_path, map_location=device))
+        policy.load_state_dict(torch.load(model_path, map_location=device))
         policy.eval()
 
         eval_env = BreakoutPixels(num_envs=1, framestack=args.framestack)
@@ -298,20 +293,21 @@ if __name__ == '__main__':
 
         for ep in range(3):
             ob, _ = eval_env.reset()
+            eval_state = {
+                'lstm_h': torch.zeros(1, policy.hidden_size, device=device),
+                'lstm_c': torch.zeros(1, policy.hidden_size, device=device),
+            }
             frames = []
             total_reward = 0
             for step in range(10000):
-                # Use the rendered grayscale frame for video
                 frame = eval_env.render()
-                # Convert to RGB for video
                 rgb = np.stack([frame, frame, frame], axis=-1)
-                # Scale up 4x
                 rgb = np.repeat(np.repeat(rgb, 4, axis=0), 4, axis=1)
                 frames.append(rgb)
 
                 with torch.no_grad():
-                    ob_t = torch.as_tensor(ob).float().to(device)
-                    logits, _ = policy.forward_eval(ob_t)
+                    ob_t = torch.as_tensor(ob).to(device)
+                    logits, _ = policy.forward_eval(ob_t, eval_state)
                     action = logits.argmax(dim=-1).cpu().numpy()
                     action = action.reshape(eval_env.action_space.shape)
 
@@ -321,21 +317,21 @@ if __name__ == '__main__':
                     break
 
             print(f"  Episode {ep+1}: {len(frames)} frames, reward={total_reward:.0f}")
-            imageio.mimsave(f'videos/breakout_cnn_ep{ep+1}.mp4', frames, fps=15)
-            imageio.mimsave(f'videos/breakout_cnn_ep{ep+1}.gif', frames, fps=15, loop=0)
+            imageio.mimsave(f'videos/breakout_cnn_lstm_ep{ep+1}.mp4', frames, fps=15)
+            imageio.mimsave(f'videos/breakout_cnn_lstm_ep{ep+1}.gif', frames, fps=15, loop=0)
 
         eval_env.close()
         print("Videos saved to videos/")
         sys.exit(0)
 
-    # === TRAINING (CleanRL-style PPO) ===
+    # === TRAINING (PPO with LSTM) ===
     optimizer = torch.optim.Adam(policy.parameters(), lr=args.learning_rate, eps=1e-5)
 
     batch_size = args.num_envs * args.num_steps
-    minibatch_size = batch_size // args.num_minibatches
+    envs_per_minibatch = args.num_envs // args.num_minibatches
     num_iterations = args.total_timesteps // batch_size
 
-    # Storage — all on GPU
+    # Storage — all on GPU, shape (num_steps, num_envs, ...)
     obs_buf = torch.zeros((args.num_steps, args.num_envs) +
                           env.single_observation_space.shape, dtype=torch.uint8, device=device)
     actions_buf = torch.zeros((args.num_steps, args.num_envs), dtype=torch.long, device=device)
@@ -353,6 +349,12 @@ if __name__ == '__main__':
         next_obs = torch.as_tensor(next_obs).to(device)
     next_done = torch.zeros(args.num_envs, device=device)
 
+    # LSTM state — persists across rollout steps
+    lstm_state = {
+        'lstm_h': torch.zeros(args.num_envs, policy.hidden_size, device=device),
+        'lstm_c': torch.zeros(args.num_envs, policy.hidden_size, device=device),
+    }
+
     global_step = 0
     start_time = time.time()
     episode_returns = deque(maxlen=100)
@@ -362,8 +364,8 @@ if __name__ == '__main__':
     os.makedirs(save_dir, exist_ok=True)
 
     print(f"\nTraining for {args.total_timesteps:,} steps ({num_iterations} iterations)")
-    print(f"Batch size: {batch_size:,}, Minibatch size: {minibatch_size:,}")
-    print(f"Fused CUDA normalize, cuDNN convolutions")
+    print(f"Batch: {args.num_envs} envs × {args.num_steps} steps, "
+          f"{args.num_minibatches} minibatches ({envs_per_minibatch} envs each)")
     print()
 
     for iteration in range(1, num_iterations + 1):
@@ -371,13 +373,18 @@ if __name__ == '__main__':
             frac = 1.0 - (iteration - 1.0) / num_iterations
             optimizer.param_groups[0]["lr"] = frac * args.learning_rate
 
+        # Save initial LSTM state for PPO replay
+        initial_lstm_h = lstm_state['lstm_h'].clone()
+        initial_lstm_c = lstm_state['lstm_c'].clone()
+
+        # === ROLLOUT ===
         for step in range(args.num_steps):
             global_step += args.num_envs
             obs_buf[step] = next_obs
             dones_buf[step] = next_done
 
             with torch.no_grad():
-                logits, value = policy.forward_eval(next_obs)
+                logits, value = policy.forward_eval(next_obs, lstm_state)
                 values_buf[step] = value.flatten()
                 probs = torch.distributions.Categorical(logits=logits)
                 action = probs.sample()
@@ -395,15 +402,21 @@ if __name__ == '__main__':
             rewards_buf[step] = torch.as_tensor(reward, dtype=torch.float32, device=device) if not isinstance(reward, torch.Tensor) else reward.to(device)
             next_done = torch.as_tensor(next_done_np, dtype=torch.float32, device=device)
 
+            # Reset LSTM state for terminated envs
+            done_mask = next_done.bool()
+            if done_mask.any():
+                lstm_state['lstm_h'][done_mask] = 0
+                lstm_state['lstm_c'][done_mask] = 0
+
             env_ep_rewards += reward
             done_envs = np.where(next_done_np)[0]
             for idx in done_envs:
                 episode_returns.append(env_ep_rewards[idx])
                 env_ep_rewards[idx] = 0.0
 
-        # GAE
+        # === GAE ===
         with torch.no_grad():
-            next_value = policy.forward_eval(next_obs)[1].flatten()
+            next_value = policy.forward_eval(next_obs, lstm_state)[1].flatten()
             advantages = torch.zeros_like(rewards_buf)
             lastgaelam = 0
             for t in reversed(range(args.num_steps)):
@@ -417,43 +430,50 @@ if __name__ == '__main__':
                 advantages[t] = lastgaelam = delta + args.gamma * args.gae_lambda * nextnonterminal * lastgaelam
             returns = advantages + values_buf
 
-        # Flatten
-        b_obs = obs_buf.reshape((-1,) + env.single_observation_space.shape)
-        b_logprobs = logprobs_buf.reshape(-1)
-        b_actions = actions_buf.reshape(-1)
-        b_advantages = advantages.reshape(-1)
-        b_returns = returns.reshape(-1)
-        b_values = values_buf.reshape(-1)
-
-        # PPO update
-        b_inds = np.arange(batch_size)
+        # === PPO UPDATE (sequence-based for LSTM) ===
+        # Minibatch over environments, preserving time order
+        env_inds = np.arange(args.num_envs)
         clipfracs = []
         for epoch in range(args.update_epochs):
-            np.random.shuffle(b_inds)
-            for start in range(0, batch_size, minibatch_size):
-                end = start + minibatch_size
-                mb_inds = b_inds[start:end]
+            np.random.shuffle(env_inds)
+            for start in range(0, args.num_envs, envs_per_minibatch):
+                mb_envs = env_inds[start:start + envs_per_minibatch]
 
-                logits, newvalue = policy.forward_eval(b_obs[mb_inds])
-                probs = torch.distributions.Categorical(logits=logits)
-                newlogprob = probs.log_prob(b_actions[mb_inds])
-                entropy = probs.entropy()
+                # Get sequences for this minibatch of envs
+                mb_obs = obs_buf[:, mb_envs]            # (T, mb, C, H, W)
+                mb_actions = actions_buf[:, mb_envs]    # (T, mb)
+                mb_logprobs = logprobs_buf[:, mb_envs]  # (T, mb)
+                mb_advantages = advantages[:, mb_envs]  # (T, mb)
+                mb_returns = returns[:, mb_envs]         # (T, mb)
+                mb_dones = dones_buf[:, mb_envs]         # (T, mb)
+
+                # Replay through CNN + LSTM with done masking
+                logits, newvalue = policy.forward_sequence(
+                    mb_obs, mb_dones,
+                    initial_lstm_h[mb_envs], initial_lstm_c[mb_envs])
+
+                # logits: (T*mb, A), newvalue: (T*mb, 1)
                 newvalue = newvalue.view(-1)
+                mb_actions_flat = mb_actions.reshape(-1)
+                probs = torch.distributions.Categorical(logits=logits)
+                newlogprob = probs.log_prob(mb_actions_flat)
+                entropy = probs.entropy()
 
-                logratio = newlogprob - b_logprobs[mb_inds]
+                mb_logprobs_flat = mb_logprobs.reshape(-1)
+                logratio = newlogprob - mb_logprobs_flat
                 ratio = logratio.exp()
 
                 with torch.no_grad():
                     clipfracs.append(((ratio - 1.0).abs() > args.clip_coef).float().mean().item())
 
-                mb_advantages = b_advantages[mb_inds]
-                mb_advantages = (mb_advantages - mb_advantages.mean()) / (mb_advantages.std() + 1e-8)
+                mb_adv_flat = mb_advantages.reshape(-1)
+                mb_adv_flat = (mb_adv_flat - mb_adv_flat.mean()) / (mb_adv_flat.std() + 1e-8)
 
-                pg_loss1 = -mb_advantages * ratio
-                pg_loss2 = -mb_advantages * torch.clamp(ratio, 1 - args.clip_coef, 1 + args.clip_coef)
+                pg_loss1 = -mb_adv_flat * ratio
+                pg_loss2 = -mb_adv_flat * torch.clamp(ratio, 1 - args.clip_coef, 1 + args.clip_coef)
                 pg_loss = torch.max(pg_loss1, pg_loss2).mean()
 
-                v_loss = 0.5 * ((newvalue - b_returns[mb_inds]) ** 2).mean()
+                v_loss = 0.5 * ((newvalue - mb_returns.reshape(-1)) ** 2).mean()
                 entropy_loss = entropy.mean()
                 loss = pg_loss - args.ent_coef * entropy_loss + v_loss * args.vf_coef
 
@@ -475,7 +495,7 @@ if __name__ == '__main__':
 
         # Save checkpoint every 100 iterations
         if iteration % 100 == 0 or iteration == num_iterations:
-            path = os.path.join(save_dir, f'breakout_cnn_{global_step}.pt')
+            path = os.path.join(save_dir, f'breakout_cnn_lstm_{global_step}.pt')
             torch.save(policy.state_dict(), path)
 
     env.close()
