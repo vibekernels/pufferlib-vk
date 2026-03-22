@@ -39,16 +39,25 @@ python breakout_pixels.py eval
 
 ## Results
 
-| | MLP-LSTM (state) | CNN (pixels) |
-|---|---|---|
-| Observation | 118-dim vector | 84x84x4 grayscale |
-| Parameters | 148K | 1.7M |
-| Training SPS | 2.3M | 52K |
-| Time to 300 avg return | ~90s | ~6 min |
-| Max achieved score | 864/864 (perfect) | ~350 |
-| Time to perfect score | 3.5 min (500M steps) | Not achieved at 50M |
+| | MLP-LSTM (state) | CNN (pixels) | CNN-LSTM (pixels) |
+|---|---|---|---|
+| Observation | 118-dim vector | 84x84x4 grayscale | 84x84x4 grayscale |
+| Parameters | 148K | 1.7M | 612K |
+| Training SPS | 2.3M | 75K | ~45K |
+| Avg return (50M steps) | 864 (perfect) | ~350 | ~260 |
+| Max achieved score | 864/864 (perfect) | ~350 | ~260 |
 
-The state-based agent achieves perfect scores consistently in under 4 minutes. The CNN agent learns a solid policy from pixels, reaching ~350 avg return in 16 minutes. The speed gap is primarily due to CNN forward/backward pass cost.
+The state-based agent achieves perfect scores consistently in under 4 minutes. The CNN agent with frame stacking is the best pixel-based approach, reaching ~350 avg return. Adding an LSTM on top of the CNN (to replace frame stacking for temporal information) actually performs worse — frame stacking provides velocity information more efficiently than an LSTM for Breakout.
+
+### Optimization progression (pixel CNN)
+
+| Optimization | SPS |
+|---|---|
+| Baseline (CPU rendering + PyTorch normalize) | 52K |
+| GPU-direct observations (eliminate CPU roundtrip) | 66K |
+| Fused CUDA uint8→float normalize kernel | 75K |
+
+The CNN forward/backward pass is the dominant bottleneck. Custom CUDA convolution kernels were tested but cuDNN outperforms them (Winograd + tensor cores). `torch.compile` and bf16 were also tested but hurt performance for this small CNN.
 
 ## Renderers
 
@@ -64,6 +73,7 @@ The CUDA renderer is used by default. End-to-end training SPS is ~52K regardless
 ## Files
 
 - `breakout_pixels.py` — Pixel-observation PufferEnv wrapper, CNN policy, and PPO training loop
+- `fused_cnn.py` — Fused CUDA uint8→float normalize kernel + NatureCNN and CNN-LSTM models
 - `cuda_renderer.py` — CUDA kernel renderer compiled at runtime via `torch.utils.cpp_extension.load_inline`
 - `fast_renderer.py` — Fallback GPU renderer using torch matmul (no CUDA compilation needed)
 - `make_videos.py` — Video generation for the state-based trained agent
