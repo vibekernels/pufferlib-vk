@@ -45,9 +45,10 @@ python breakout_pixels.py eval
 | Parameters | 148K | 1.7M | 612K |
 | Training SPS | 2.3M | 100K | ~45K |
 | Avg return (50M steps) | 864 (perfect) | ~350 | ~260 |
-| Max achieved score | 864/864 (perfect) | ~350 | ~260 |
+| Avg return (500M steps) | 864 (perfect) | ~350 (plateaus) | N/A |
+| Training time (500M) | ~3.5 min | ~81 min | N/A |
 
-The state-based agent achieves perfect scores consistently in under 4 minutes. The CNN agent with frame stacking is the best pixel-based approach, reaching ~350 avg return. Adding an LSTM on top of the CNN (to replace frame stacking for temporal information) actually performs worse — frame stacking provides velocity information more efficiently than an LSTM for Breakout.
+The state-based agent achieves perfect scores consistently in under 4 minutes. The CNN agent with frame stacking is the best pixel-based approach, plateauing at ~350 avg return regardless of training duration — 500M steps produces the same score as 50M. The gap to perfect scores is a fundamental limitation of learning from pixels with a feedforward CNN. Adding an LSTM on top of the CNN actually performs worse — frame stacking provides velocity information more efficiently than an LSTM for Breakout.
 
 ### Optimization progression (pixel CNN)
 
