@@ -30,8 +30,8 @@ python make_videos.py
 Wraps puffer_breakout with a GPU renderer that produces 84x84 grayscale frames, then trains a 1.7M-parameter NatureCNN policy via PPO.
 
 ```bash
-# Train (50M steps, ~16 min on 5090)
-python breakout_pixels.py train --total-timesteps 50000000 --num-envs 256
+# Train (500M steps, default 512 envs on 5090)
+python breakout_pixels.py train
 
 # Generate evaluation videos
 python breakout_pixels.py eval
@@ -43,7 +43,7 @@ python breakout_pixels.py eval
 |---|---|---|---|
 | Observation | 118-dim vector | 84x84x4 grayscale | 84x84x4 grayscale |
 | Parameters | 148K | 1.7M | 612K |
-| Training SPS | 2.3M | 75K | ~45K |
+| Training SPS | 2.3M | 100K | ~45K |
 | Avg return (50M steps) | 864 (perfect) | ~350 | ~260 |
 | Max achieved score | 864/864 (perfect) | ~350 | ~260 |
 
@@ -56,8 +56,9 @@ The state-based agent achieves perfect scores consistently in under 4 minutes. T
 | Baseline (CPU rendering + PyTorch normalize) | 52K |
 | GPU-direct observations (eliminate CPU roundtrip) | 66K |
 | Fused CUDA uint8→float normalize kernel | 75K |
+| Tuned batch params (512 envs, 2mb, 3 epochs) | 100K |
 
-The CNN forward/backward pass is the dominant bottleneck. Custom CUDA convolution kernels were tested but cuDNN outperforms them (Winograd + tensor cores). `torch.compile` and bf16 were also tested but hurt performance for this small CNN.
+The CNN forward/backward pass is the dominant bottleneck. Custom CUDA convolution kernels were tested but cuDNN outperforms them (Winograd + tensor cores). `torch.compile`, bf16, and fp16 autocast were all tested but hurt performance for this small CNN — the network is too small for tensor cores to help.
 
 ## Renderers
 

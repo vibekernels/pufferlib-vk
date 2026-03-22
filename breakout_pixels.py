@@ -251,10 +251,10 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('mode', choices=['train', 'eval'], default='train')
     parser.add_argument('--total-timesteps', type=int, default=500_000_000)
-    parser.add_argument('--num-envs', type=int, default=128)
+    parser.add_argument('--num-envs', type=int, default=512)
     parser.add_argument('--num-steps', type=int, default=128)
-    parser.add_argument('--num-minibatches', type=int, default=4)
-    parser.add_argument('--update-epochs', type=int, default=4)
+    parser.add_argument('--num-minibatches', type=int, default=2)
+    parser.add_argument('--update-epochs', type=int, default=3)
     parser.add_argument('--learning-rate', type=float, default=2.5e-4)
     parser.add_argument('--gamma', type=float, default=0.99)
     parser.add_argument('--gae-lambda', type=float, default=0.95)
@@ -280,6 +280,7 @@ if __name__ == '__main__':
                                framestack=args.framestack).to(device)
     num_params = sum(p.numel() for p in policy.parameters())
     print(f"Policy: FusedBreakoutCNN, {num_params:,} params")
+    print(f"Config: {args.num_envs} envs, {args.num_minibatches} minibatches, {args.update_epochs} epochs")
 
     if args.mode == 'eval':
         model_path = args.model_path or max(
